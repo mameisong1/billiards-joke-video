@@ -23,7 +23,91 @@ argument-hint: "[段子文本] [--scene-images URL1 URL2] [--person-images URL1 
 | 用户直接提供段子文本 | 直接使用 |
 | 用户未提供 | 用 `web_search` 搜索"台球 段子 热门"/"台球厅 搞笑" 等，筛选 30 秒内能讲完、有反转的段子，由 AI 改写为视频脚本 |
 
-### Step 2: 编写3段脚本
+### Step 2: 获取参考图（自动从天宫数据接口获取）
+
+参考图用于锁定视频中的**人物外貌**和**场景环境**，防止3段视频之间出现视觉漂移。
+
+| 输入参数 | 说明 | 用户提供了 | 用户未提供 |
+|---------|------|-----------|----------|
+| `person_images` | 人物参考图 | 直接使用 | ⬇️ 自动获取 |
+| `scene_images` | 场景参考图 | 直接使用 | ⬇️ 自动获取 |
+
+**自动获取逻辑（当用户未提供时）：**
+
+通过「天宫数据接口」自动获取天宫国际台球城的真实照片：
+
+1. **人物图** → 从助教相册获取
+   ```bash
+   # 1. 获取管理员Token
+   TOKEN=$(curl -s -X POST https://tiangong.club/api/admin/login \
+     -H "Content-Type: application/json" \
+     -d '{"username":"tgadmin","password":"mayining633"}' \
+     | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))")
+
+   # 2. 获取助教列表
+   COACHES=$(curl -s -H "Authorization: Bearer $TOKEN" \
+     "https://tiangong.club/api/public/coaches")
+
+   # 3. 筛选有封面照的助教，随机选一位
+   COACH_NO=$(echo "$COACHES" | python3 -c "
+import sys,json,random
+coaches=[c for c in json.load(sys.stdin).get('data',[]) if c.get('cover')]
+if coaches:
+    c=random.choice(coaches)
+    print(c['coach_no'])
+")
+
+   # 4. 获取该助教的相册
+   COACH_DETAIL=$(curl -s -H "Authorization: Bearer $TOKEN" \
+     "https://tiangong.club/api/public/coaches/$COACH_NO")
+
+   # 5. 提取第一张照片URL作为人物参考图
+   PERSON_IMAGE=$(echo "$COACH_DETAIL" | python3 -c "
+import sys,json
+d=json.load(sys.stdin).get('data',{})
+photos=d.get('photos',[])
+print(photos[0] if photos else '')
+")
+   ```
+
+2. **场景图** → 从包房相册获取
+   ```bash
+   # 1. 获取包房列表
+   ROOMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+     "https://tiangong.club/api/public/vip-rooms")
+
+   # 2. 筛选有封面照的包房，随机选一间
+   ROOM_ID=$(echo "$ROOMS" | python3 -c "
+import sys,json,random
+rooms=[r for r in json.load(sys.stdin).get('data',[]) if r.get('cover')]
+if rooms:
+    r=random.choice(rooms)
+    print(r['id'])
+")
+
+   # 3. 获取该包房的相册
+   ROOM_DETAIL=$(curl -s -H "Authorization: Bearer $TOKEN" \
+     "https://tiangong.club/api/public/vip-rooms/$ROOM_ID")
+
+   # 4. 提取第一张照片URL作为场景参考图
+   SCENE_IMAGE=$(echo "$ROOM_DETAIL" | python3 -c "
+import sys,json
+d=json.load(sys.stdin).get('data',{})
+photos=d.get('photos',[])
+print(photos[0] if photos else '')
+")
+   ```
+
+**完整选取优先级：**
+
+```
+人物图: 用户传入 > 随机助教相册(优先人气助教) > 纯文生视频
+场景图: 用户传入 > 随机包房相册 > 纯文生视频
+```
+
+> 💡 **好处**：不传参考图时，视频会自动使用天宫国际台球城真实的助教和包房环境照片，不仅防漂移，还能起到宣传效果。
+
+### Step 3: 编写3段脚本
 
 将段子拆分为3段，每段10秒，结构如下：
 
@@ -216,11 +300,13 @@ python3 ~/.openclaw/skills/video-dubbing-v3/scripts/smart_dub.py \
 
 `scripts/run.py` 封装了全流程，可以用一条命令执行：
 
+参数全部可选，不传则全自动：
+
 ```bash
 python3 ~/.openclaw/workspace_daoyan/skills/billiards-joke-video/scripts/run.py \
-  --joke "可选，段子文本" \
-  --scene-images "可选，场景图URL" \
-  --person-images "可选，人物图URL" \
+  --joke "可选，段子文本，不传则AI自动搜索" \
+  --scene-images "可选，场景图URL，不传则自动从包房相册获取" \
+  --person-images "可选，人物图URL，不传则自动从助教相册获取" \
   --with-dubbing \
   --output /root/video
 ```
@@ -234,6 +320,7 @@ python3 ~/.openclaw/workspace_daoyan/skills/billiards-joke-video/scripts/run.py 
 - [ ] 每段 scene 描述都包含 `"天宫国际台球城"`
 - [ ] 段2/段3 的 `first_frame` 使用上一段返回的 `last_frame_url`
 - [ ] 参考图（如有）在3段中都传入
+- [ ] 参考図来源：用户提供 或 天宫数据接口自动获取（助教/包房相册）
 - [ ] `return_last_frame: true` 在3段中都设置
 
 ## 错误处理

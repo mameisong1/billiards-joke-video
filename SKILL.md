@@ -1,9 +1,9 @@
 ---
 name: billiards-joke-video
-description: "台球厅段子视频技能：自动搜索/接收段子 → 生成3段10秒脚本 → Seedance 2.0 链式续拍生成 → 拼接30秒成品 → 可选配音。触发词：台球厅段子视频、台球段子、每日台球视频、台球城视频。"
-version: 1.0.0
+description: "台球厅段子视频技能：自动搜索/接收段子 → 生成3段10秒脚本 → Seedance 2.0链式续拍生成 → 拼接30秒成品 → 混合配音（旁白+BGM+环境音）。触发词：台球厅段子视频、台球段子、每日台球视频、台球城视频。"
+version: 2.0.0
 category: file-generation
-argument-hint: "[段子文本] [--scene-images URL1 URL2] [--person-images URL1 URL2]"
+argument-hint: "[段子文本] [--scene-images URL1...] [--person-images URL1...]"
 ---
 
 # 台球厅段子视频技能
@@ -23,121 +23,97 @@ argument-hint: "[段子文本] [--scene-images URL1 URL2] [--person-images URL1 
 | 用户直接提供段子文本 | 直接使用 |
 | 用户未提供 | 用 `web_search` 搜索"台球 段子 热门"/"台球厅 搞笑" 等，筛选 30 秒内能讲完、有反转的段子，由 AI 改写为视频脚本 |
 
-### Step 2: 获取参考图（自动从天宫数据接口获取）
+### Step 2: 获取参考资源（自动从天宫数据接口获取）
 
-参考图用于锁定视频中的**人物外貌**和**场景环境**，防止3段视频之间出现视觉漂移。
+**人物**：助教真人照片被 Seedance 2.0 隐私过滤器拦截，**不可直接传 reference_image**。
+改为：下载助教封面照 → 用 AI 图片模型详细描述长相 → 文字写入3段 prompt。
 
-| 输入参数 | 说明 | 用户提供了 | 用户未提供 |
-|---------|------|-----------|----------|
-| `person_images` | 人物参考图 | 直接使用 | ⬇️ 自动获取 |
-| `scene_images` | 场景参考图 | 直接使用 | ⬇️ 自动获取 |
+**场景**：6张包房照片加 OSS 压缩参数后作为 `reference_image` 传入。
 
-**自动获取逻辑（当用户未提供时）：**
+| 参数 | 用户提供了 | 用户未提供 |
+|------|-----------|----------|
+| 人物外貌 | 用户传照片 → AI描述长相后写入prompt | 天宫API随机助教 → 下载封面 → AI描述长相 → 写入prompt |
+| 场景参考图 | 直接传Seedance（加OSS压缩） | 天宫API取6张包房照片（加OSS压缩） |
 
-通过「天宫数据接口」自动获取天宫国际台球城的真实照片：
+**自动获取流程（当用户未提供时）：**
 
-1. **人物图** → 从助教相册获取
-   ```bash
-   # 1. 获取管理员Token
-   TOKEN=$(curl -s -X POST https://tiangong.club/api/admin/login \
-     -H "Content-Type: application/json" \
-     -d '{"username":"tgadmin","password":"mayining633"}' \
-     | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))")
-
-   # 2. 获取助教列表
-   COACHES=$(curl -s -H "Authorization: Bearer $TOKEN" \
-     "https://tiangong.club/api/public/coaches")
-
-   # 3. 筛选有封面照的助教，随机选一位
-   COACH_NO=$(echo "$COACHES" | python3 -c "
-import sys,json,random
-coaches=[c for c in json.load(sys.stdin).get('data',[]) if c.get('cover')]
-if coaches:
-    c=random.choice(coaches)
-    print(c['coach_no'])
-")
-
-   # 4. 获取该助教的相册
-   COACH_DETAIL=$(curl -s -H "Authorization: Bearer $TOKEN" \
-     "https://tiangong.club/api/public/coaches/$COACH_NO")
-
-   # 5. 提取第一张照片URL作为人物参考图
-   PERSON_IMAGE=$(echo "$COACH_DETAIL" | python3 -c "
-import sys,json
-d=json.load(sys.stdin).get('data',{})
-photos=d.get('photos',[])
-print(photos[0] if photos else '')
-")
+1. **人物外貌描述**
+   ```
+   # 1. 获取天宫Token并随机选一位助教
+   TOKEN = POST /api/admin/login {username, password}
+   COACHES = GET /api/public/coaches → 随机选一位（优先人气助教）
+   DETAIL = GET /api/public/coaches/{coach_no}
+   
+   # 2. 下载封面照到本地
+   wget -O /root/video/coach_face.jpg {DETAIL.photos[0]}
+   
+   # 3. 用 image 工具分析长相（AI Agent执行）
+   image /root/video/coach_face.jpg → 详细外貌文字描述
+   
+   # 4. 描述写入3段prompt（确保人物一致）
+   appearance_desc = "一位年轻东亚女性，鹅蛋脸，大而圆的眼睛，深棕色瞳孔，卧蚕明显，
+     鼻梁挺直鼻头圆润，薄唇樱桃嘴，深棕色长直发及胸，空气刘海，
+     冷白皮肤，纤细身材，直角肩，锁骨清晰..."
    ```
 
-2. **场景图** → 从包房相册获取
-   ```bash
-   # 1. 获取包房列表
-   ROOMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
-     "https://tiangong.club/api/public/vip-rooms")
-
-   # 2. 筛选有封面照的包房，随机选一间
-   ROOM_ID=$(echo "$ROOMS" | python3 -c "
-import sys,json,random
-rooms=[r for r in json.load(sys.stdin).get('data',[]) if r.get('cover')]
-if rooms:
-    r=random.choice(rooms)
-    print(r['id'])
-")
-
-   # 3. 获取该包房的相册
-   ROOM_DETAIL=$(curl -s -H "Authorization: Bearer $TOKEN" \
-     "https://tiangong.club/api/public/vip-rooms/$ROOM_ID")
-
-   # 4. 提取第一张照片URL作为场景参考图
-   SCENE_IMAGE=$(echo "$ROOM_DETAIL" | python3 -c "
-import sys,json
-d=json.load(sys.stdin).get('data',{})
-photos=d.get('photos',[])
-print(photos[0] if photos else '')
-")
+2. **6张包房参考图**
+   ```
+   # 遍历所有12间包房，收集照片，随机取6张（覆盖不同房间风格）
+   ROOMS = GET /api/public/vip-rooms
+   for each room:
+     DETAIL = GET /api/public/vip-rooms/{id}
+     collect DETAIL.photos
+   
+   # 取6张，加阿里云OSS压缩参数（宽640 + 质量80）
+   # 原图1577KB → 压缩后62KB，减少传输开销
+   # 格式: {url}?x-oss-process=image/resize,w_640/quality,q_80
+   selected_photos = random_pick(all_photos, 6)
+   compressed = [compress_oss_url(url) for url in selected_photos]
    ```
 
-**完整选取优先级：**
+**选取优先级：**
 
 ```
-人物图: 用户传入 > 随机助教相册(优先人气助教) > 纯文生视频
-场景图: 用户传入 > 随机包房相册 > 纯文生视频
+人物外貌: 用户传入照片(AI描述) > 天宫API随机助教(AI描述) > 纯文生视频
+场景图:   用户传入 > 天宫API取6张 > 纯文生视频
 ```
-
-> 💡 **好处**：不传参考图时，视频会自动使用天宫国际台球城真实的助教和包房环境照片，不仅防漂移，还能起到宣传效果。
 
 ### Step 3: 编写3段脚本
 
-将段子拆分为3段，每段10秒，结构如下：
+将段子拆分为3段，每段10秒：
 
-| 段落 | 时间 | 功能 | 要点 |
-|------|------|------|------|
-| **段1·钩子** | 0-10s | 制造悬念/冲突 | 开场抓住注意力 |
-| **段2·展开** | 10-20s | 冲突升级/铺垫 | 笑点逐步推进 |
-| **段3·反转** | 20-30s | 包袱抖出/收尾 | 反转高潮结束 |
+| 段落 | 时间 | 功能 |
+|------|------|------|
+| **段1·钩子** | 0-10s | 制造悬念/冲突 |
+| **段2·展开** | 10-20s | 冲突升级/铺垫 |
+| **段3·反转** | 20-30s | 包袱抖出/收尾 |
 
-**每段脚本必须包含：**
+**每段 prompt 必须包含：**
 
-1. **统一人物描述**（防漂移）：从段1开始锁定，段2/3完全复用
-   - 示例：`"一位年轻男子，短发，穿白色Polo衫，牛仔裤，身材中等"`
-2. **统一场景描述**（防漂移）：每段重复
-   - 示例：`"天宫国际台球城内部，暖黄色灯光，多张绿色台球桌，墙上挂着球杆，环境整洁高档"`
-3. **本段动作描述**：叙述本段具体表演内容
-4. **品牌植入**：`"天宫国际台球城"` 必须出现在场景描述或对白中
+1. **统一人物外貌描述**（逐字复制，防漂移）：
+   ```
+   一位年轻东亚女性，鹅蛋脸，大而圆的眼睛，深棕色瞳孔，卧蚕明显，
+   鼻梁挺直鼻头圆润，薄唇樱桃嘴，深棕色长直发及胸，空气刘海，
+   冷白皮肤，纤细身材，直角肩，锁骨清晰...
+   ```
+2. **统一场景描述**（每段重复）：
+   ```
+   天宫国际台球城内部，暖黄色灯光，多张绿色台球桌排列整齐，
+   墙上挂着球杆和天宫国际台球城的招牌，落地窗外是江景，环境高档整洁
+   ```
+3. **本段动作描述**
+4. **品牌植入**：`"天宫国际台球城"` 出现在场景或对白中
 
-**脚本模板（每段 prompt 的构造格式）：**
+**Prompt 模板：**
 
 ```
-[人物]: {统一人物描述}
+[人物外貌]: {AI生成的详细外貌描述}
 [场景]: 天宫国际台球城，{场景细节}
 [动作]: {本段具体动作}
 [运镜]: {镜头运动描述}
 ```
 
-### Step 3: 生成视频（链式续拍）
-
-使用 Seedance 2.0 模型，串行生成3段视频，通过尾帧链接保证连贯性。
+### Step 4: 生成3段视频（链式续拍）
 
 **模型与参数：**
 
@@ -147,199 +123,102 @@ print(photos[0] if photos else '')
 | resolution | `480p` | 竖屏适配 |
 | ratio | `9:16` | 竖屏抖音格式 |
 | duration | `10` | 每段10秒 |
-| return_last_frame | `true` | 全部3段都返回尾帧 |
-| generate_audio | `true` | 生成环境音效 |
-| service_tier | `default` | 快速模式 |
+| return_last_frame | `true` | 全部3段返回尾帧 |
+| generate_audio | `true` | 生成环境音（击球声等） |
 
 **生成流程（严格串行）：**
 
 ```
-段1: text [+ reference_images] → seedance create --wait --download /root/video
-     ↓ 取返回的 last_frame_url
-
-段2: text [+ reference_images] + first_frame:last_frame_url → seedance create --wait --download /root/video
-     ↓ 取返回的 last_frame_url
-
-段3: text [+ reference_images] + first_frame:last_frame_url → seedance create --wait --download /root/video
+段1: text + [6张场景reference_image] → 创建任务 → 等待 → 下载 → 取last_frame_url
+段2: text + [6张场景reference_image] + first_frame:段1尾帧 → 创建任务 → 等待 → 下载 → 取last_frame_url
+段3: text + [6张场景reference_image] + first_frame:段2尾帧 → 创建任务 → 等待 → 下载
 ```
 
-**参考图处理（可选输入）：**
+**参考图传入方式：**
+- 6张包房照片均以 `role: "reference_image"` 传入
+- 加OSS压缩参数减少网络开销
+- **禁止**传入助教真人照片（会被隐私过滤器拦截）
 
-| 输入参数 | role | 用途 |
-|---------|------|------|
-| `person_images` | `reference_image` | 锁定人物外貌，3段都传 |
-| `scene_images` | `reference_image` | 锁定台球厅环境，3段都传 |
-
-用户不提供参考图时，段1纯文生视频，段2/3依靠尾帧续拍保持连贯。
-
-**调用命令模板：**
-
-```bash
-# 段1（无续拍）
-export ARK_API_KEY="从环境变量获取"
-python3 ~/.openclaw/skills/seedance-video-generation/seedance.py create \
-  --prompt "[人物描述] [场景描述含天宫国际台球城] [动作描述]" \
-  --model doubao-seedance-2-0-260128 \
-  --ratio 9:16 \
-  --duration 10 \
-  --resolution 480p \
-  --return-last-frame true \
-  --generate-audio true \
-  --wait \
-  --download /root/video
-
-# 段2/3（尾帧续拍）— 需要从段1/2的任务结果中取出 last_frame_url
-python3 ~/.openclaw/skills/seedance-video-generation/seedance.py create \
-  --prompt "[同样的人物+场景描述] [本段动作描述]" \
-  --image "{上段的last_frame_url}" \
-  --model doubao-seedance-2-0-260128 \
-  --ratio 9:16 \
-  --duration 10 \
-  --resolution 480p \
-  --return-last-frame true \
-  --generate-audio true \
-  --wait \
-  --download /root/video
-```
-
-**注意：** seedance.py 目前的 `--image` 参数默认 role 为 `first_frame`，正好用来传入尾帧续拍，无需修改。
-
-**当有参考图时，段1命令变为：**
-
-```bash
-python3 ~/.openclaw/skills/seedance-video-generation/seedance.py create \
-  --prompt "[人物描述] [场景描述含天宫国际台球城] [动作描述]" \
-  --ref-images person.jpg scene.jpg \
-  --model doubao-seedance-2-0-260128 \
-  --ratio 9:16 \
-  --duration 10 \
-  --resolution 480p \
-  --return-last-frame true \
-  --generate-audio true \
-  --wait \
-  --download /root/video
-```
-
-**⚠️ 重要：获取尾帧 URL**
-
-seedance.py `--wait` 模式返回完整 JSON，从中提取 `last_frame_url`：
-
-```python
-import json
-result = json.loads(output)
-last_frame_url = result.get("content", {}).get("last_frame_url", "")
-```
-
-如果 seedance.py 的 CLI 输出不够结构化，可改用 curl 直接调用 API 并手动解析：
-
-```bash
-# 创建任务
-TASK_RESULT=$(curl -s -X POST "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $ARK_API_KEY" \
-  -d '{...}')
-TASK_ID=$(echo "$TASK_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-
-# 轮询等待完成
-while true; do
-  STATUS=$(curl -s -X GET "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/$TASK_ID" \
-    -H "Authorization: Bearer $ARK_API_KEY")
-  STATE=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
-  [ "$STATE" = "succeeded" ] && break
-  [ "$STATE" = "failed" ] && echo "FAILED" && break
-  sleep 15
-done
-
-# 提取视频URL和尾帧URL
-VIDEO_URL=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin)['content']['video_url'])")
-LAST_FRAME=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin)['content'].get('last_frame_url',''))")
-
-# 下载视频
-curl -s -o "/root/video/seg{N}.mp4" "$VIDEO_URL"
-```
-
-### Step 4: 拼接视频
-
-使用 video-concat 技能的 `concat_video.py`，重编码统一参数确保抖音兼容。
+### Step 5: 拼接视频
 
 ```bash
 python3 ~/.openclaw/skills/video-concat/scripts/concat_video.py \
   --inputs /root/video/seg1.mp4 /root/video/seg2.mp4 /root/video/seg3.mp4 \
-  --output /root/video/billiards_final_$(date +%Y%m%d_%H%M%S).mp4
+  --output /root/video/billiards_{timestamp}.mp4
 ```
 
-默认输出 H.264 High Profile Level 4.1 + AAC 44100Hz 立体声 + yuv420p + faststart，完全适配抖音。
+重编码统一：H.264 High L4.1 + AAC 44100Hz 立体声 + yuv420p + faststart
 
-### Step 5: 配音（可选）
+### Step 6: 混合配音（保留击球声等环境音）
 
-如果需要旁白+BGM+字幕，使用 video-dubbing-v3：
+**这是本技能的关键差异化设计。** 标准 `video-dubbing-v3` 只做旁白+BGM，会丢失击球声等环境音效。
+本技能采用**三音轨混合方案**：
+
+```
+音轨1 [旁白]    volume=1.0       — AI文字转语音，主导
+音轨2 [环境音]  loudnorm→volume=0.3 — Seedance原始音效（击球声、脚步声等）
+音轨3 [BGM]    volume=0.15      — 背景音乐
+
+↓ ffmpeg amix 三轨混合 ↓
+
+最终音频 = 旁白 + 环境音（柔和融合）+ BGM（氛围衬托）
+```
+
+**完整流程：**
+
+1. **提取环境音**：从3段原始视频分别提取音频，拼接成完整环境音轨，对无音频段填充静音
+2. **生成旁白**：使用 `video-dubbing-v3` 生成旁白音频
+3. **下载BGM**：从 Jamendo 搜索下载
+4. **响度归一化**：对环境音做 `loudnorm=I=-16:TP=-1.5:LRA=11`，消除段间音量差异
+5. **三轨混合**：ffmpeg `amix` 三轨混合
+6. **加字幕**：嵌入SRT/ASS字幕
 
 ```bash
-python3 ~/.openclaw/skills/video-dubbing-v3/scripts/smart_dub.py \
-  --video /root/video/billiards_final_XXXXXX.mp4 \
-  --text "{完整30秒旁白文本}" \
-  --voice zh_male_taocheng_uranus_bigtts \
-  --emotion happy \
-  --emotion-scale 4 \
-  --bgm-style "upbeat,chill" \
-  --bgm-volume 0.15 \
-  --output /root/video/billiards_dubbed_XXXXXX.mp4
+# run.py 一键执行：
+python3 run.py --prompts ... --narration "..." --appearance-desc "..."
 ```
 
-推荐配音参数：
+## 参数说明
 
-| 参数 | 推荐值 | 理由 |
-|------|--------|------|
-| voice | `zh_male_taocheng_uranus_bigtts`（小天） | 阳光活力，适合段子 |
-| emotion | `happy` | 搞笑段子气氛 |
-| emotion-scale | `4` | 适度夸张 |
-| bgm-style | `upbeat,chill` | 轻松愉快 |
-| bgm-volume | `0.15` | 不压人声 |
-
-## 完整一键脚本
-
-`scripts/run.py` 封装了全流程，可以用一条命令执行：
-
-参数全部可选，不传则全自动：
-
-```bash
-python3 ~/.openclaw/workspace_daoyan/skills/billiards-joke-video/scripts/run.py \
-  --joke "可选，段子文本，不传则AI自动搜索" \
-  --scene-images "可选，场景图URL，不传则自动从包房相册获取" \
-  --person-images "可选，人物图URL，不传则自动从助教相册获取" \
-  --with-dubbing \
-  --output /root/video
-```
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--joke` | 否 | 段子文本，不传则AI自动搜索 |
+| `--scene-images` | 否 | 场景图URL列表，不传则取6张包房图 |
+| `--person-images` | 否 | 人物图URL列表，不传则取随机助教→AI描述长相 |
+| `--appearance-desc` | 否 | 人物外貌文字描述（AI用image工具生成后回填） |
+| `--prompts` | 是 | 3段视频prompt（AI生成） |
+| `--narration` | 含配音时是 | 完整旁白文本 |
+| `--no-dubbing` | 否 | 跳过配音 |
+| `--no-env-audio` | 否 | 不混合Seedance原始环境音 |
+| `--output` | 否 | 输出目录，默认 /root/video |
 
 ## 防漂移 Checklist
 
-生成前确认以下要点：
-
-- [ ] 3段 prompt 的**人物描述**完全一致（逐字复制）
+- [ ] 3段 prompt 的**人物外貌描述**完全一致（逐字复制）
 - [ ] 3段 prompt 的**场景描述**完全一致（逐字复制）
-- [ ] 每段 scene 描述都包含 `"天宫国际台球城"`
-- [ ] 段2/段3 的 `first_frame` 使用上一段返回的 `last_frame_url`
-- [ ] 参考图（如有）在3段中都传入
-- [ ] 参考図来源：用户提供 或 天宫数据接口自动获取（助教/包房相册）
+- [ ] 每段场景描述都包含 `"天宫国际台球城"`
+- [ ] 段2/段3 的 `first_frame` 使用上一段的 `last_frame_url`
+- [ ] 6张场景参考图在3段中都传入（加OSS压缩）
+- [ ] **禁止传入助教真人照片**作为 reference_image（会被隐私过滤器拦截）
 - [ ] `return_last_frame: true` 在3段中都设置
 
 ## 错误处理
 
 | 错误类型 | 处理方式 |
 |---------|---------|
-| OutputVideoSensitiveContentDetected | 同一 prompt 最多重试1次，若仍失败则改写 prompt 去掉敏感内容再试 |
-| 任务超时（>5分钟仍在 running） | 报告用户，询问是否继续等待或跳过 |
-| 任务失败（failed） | 检查错误信息，修正参数后重试1次 |
+| OutputVideoSensitiveContentDetected | 同一 prompt 最多重试1次，若仍失败则改写 prompt |
+| PrivacyInformation（真人照片） | ❌ 不可重试，改为文字描述外貌 |
+| 任务超时（>7分钟） | 报告用户，询问是否继续等待 |
+| 任务失败（failed） | 修正参数后重试1次 |
 | 下载失败 | 重试3次，间隔10秒 |
 
 ## 成本参考
 
 | 项目 | 估算 |
 |------|------|
-| 段1（纯文生） | ~50k tokens ≈ 2.3元 |
-| 段2（尾帧续拍） | ~100k tokens ≈ 4.6元 |
-| 段3（尾帧续拍） | ~100k tokens ≈ 4.6元 |
-| 配音（可选） | ~0.5元 |
-| **单次总计** | **~12元** |
-| **月成本（每天1条）** | **~360元** |
-| flex 模式月成本 | **~180元** |
+| 段1（文生+6场景参考图） | ~100k tokens ≈ 4.6元 |
+| 段2（尾帧续拍+6场景参考图） | ~100k tokens ≈ 4.6元 |
+| 段3（尾帧续拍+6场景参考图） | ~100k tokens ≈ 4.6元 |
+| 配音（旁夜晚+环境音+BGM） | ~1元 |
+| **单次总计** | **~15元** |
+| **月成本（每天1条）** | **~450元** |

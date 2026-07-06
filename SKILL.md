@@ -126,16 +126,32 @@ argument-hint: "[段子文本] [--scene-images URL1...] [--person-images URL1...
 | return_last_frame | `true` | 全部3段返回尾帧 |
 | generate_audio | `true` | 生成环境音（击球声等） |
 
+**⚠️ 重要API限制：first_frame 与 reference_image 互斥！**
+
+Seedance 2.0 API 不允许在同一个请求中同时传入 `first_frame` 和 `reference_image`。
+返回错误：`first/last frame content cannot be mixed with reference media content`
+
+因此，**段2/段3 只能用 first_frame 续拍，不能再传场景参考图**。
+
 **生成流程（严格串行）：**
 
 ```
 段1: text + [6张场景reference_image] → 创建任务 → 等待 → 下载 → 取last_frame_url
-段2: text + [6张场景reference_image] + first_frame:段1尾帧 → 创建任务 → 等待 → 下载 → 取last_frame_url
-段3: text + [6张场景reference_image] + first_frame:段2尾帧 → 创建任务 → 等待 → 下载
+段2: text + first_frame:段1尾帧（无reference_image） → 创建任务 → 等待 → 下载 → 取last_frame_url
+段3: text + first_frame:段2尾帧（无reference_image） → 创建任务 → 等待 → 下载
 ```
 
+**场景一致性保障（因段2/3无参考图的补偿措施）：**
+1. 3段 prompt 的场景描述必须逐字一致（从段1复制粘贴）
+2. 3段 prompt 的人物外貌描述必须逐字一致
+3. 段1 的参考图决定了整体色调和氛围，段2/3通过 first_frame + 文字描述维持
+
+**替代方案（成本较高）：**
+- 段2/段3 用 `reference_video`（传段1的视频）代替 `first_frame`
+- 成本约贵70%（tokens≈171k vs 100k），但场景一致性更好
+
 **参考图传入方式：**
-- 6张包房照片均以 `role: "reference_image"` 传入
+- 6张包房照片仅段1以 `role: "reference_image"` 传入
 - 加OSS压缩参数减少网络开销
 - **禁止**传入助教真人照片（会被隐私过滤器拦截）
 
@@ -198,7 +214,8 @@ python3 run.py --prompts ... --narration "..." --appearance-desc "..."
 - [ ] 3段 prompt 的**场景描述**完全一致（逐字复制）
 - [ ] 每段场景描述都包含 `"天宫国际台球城"`
 - [ ] 段2/段3 的 `first_frame` 使用上一段的 `last_frame_url`
-- [ ] 6张场景参考图在3段中都传入（加OSS压缩）
+- [ ] **段2/段3 不传入 reference_image**（与 first_frame 互斥）
+- [ ] 6张场景参考图仅在段1中传入（加OSS压缩）
 - [ ] **禁止传入助教真人照片**作为 reference_image（会被隐私过滤器拦截）
 - [ ] `return_last_frame: true` 在3段中都设置
 
@@ -208,9 +225,57 @@ python3 run.py --prompts ... --narration "..." --appearance-desc "..."
 |---------|---------|
 | OutputVideoSensitiveContentDetected | 同一 prompt 最多重试1次，若仍失败则改写 prompt |
 | PrivacyInformation（真人照片） | ❌ 不可重试，改为文字描述外貌 |
+| InvalidParameter: first/last frame cannot mix with reference | 移除 reference_image，仅用 first_frame 续拍 |
 | 任务超时（>7分钟） | 报告用户，询问是否继续等待 |
 | 任务失败（failed） | 修正参数后重试1次 |
 | 下载失败 | 重试3次，间隔10秒 |
+| Python urllib 挂起 | 改用 `subprocess.run(["curl", ...])` 发HTTP请求（见下方踩坑记录） |
+| UnicodeEncodeError: latin-1 | 确保HTTP请求通过curl发送，不通过Python urllib传递含中文的body |
+| ARK_API_KEY 环境变量丢失 | exec 子进程不继承 ~/.bashrc，需在脚本内 source 或硬编码读取 |
+
+## 踩坑记录
+
+### 1. Python `urllib.request` 在 exec 环境中挂起
+**现象：** Python脚本使用 `urllib.request.urlopen()` 发HTTP请求时，在 OpenClaw exec 子进程中经常挂起无输出。
+**原因：** exec 子进程的stdout缓冲、信号处理与正常终端不同，urlopen 容易卡死。
+**解决：** 全部改用 `subprocess.run(["curl", "-s", "-X", "POST", ...])` 发HTTP请求，curl 在这种环境中稳定可靠。**run.py 中的 `api_call()` 函数已改用curl实现。**
+
+### 2. `UnicodeEncodeError: 'latin-1' codec can't encode character`
+**现象：** seedance.py 用 `urllib.request` 传含中文的 prompt，报编码错误。
+**原因：** Python `http.client` 会尝试用 `latin-1` 编码 HTTP header，中文 prompt 作为 body 的一部分也受影响。
+**解决：** 使用 curl 发请求，curl 对 UTF-8 body 处理无问题。如果必须用 Python，确保用 `json.dumps(data).encode("utf-8")` 并设置正确的 Content-Type header。
+
+### 3. `ARK_API_KEY` 环境变量在 exec 子进程中丢失
+**现象：** 脚本中 `os.environ.get("ARK_API_KEY")` 返回 None，但 `~/.bashrc` 中已 export。
+**原因：** OpenClaw exec 子进程是非登录 shell，不自动 source `~/.bashrc`。
+**解决：** `get_api_key()` 函数已改为：先检查环境变量，若为空则主动读取 `~/.bashrc` 文件解析。确保在任何 exec 环境中都能获取到 key。
+
+### 4. first_frame 与 reference_image 互斥
+**现象：** 再续拍请求中同时传 first_frame 和 reference_image，报错 `InvalidParameter: first/last frame content cannot be mixed with reference media content`。
+**原因：** Seedance 2.0 API 硬性限制，两种引用模式互斥。
+**解决：** 段1用 reference_image，段2/段3只用 first_frame。补偿措施：3段 prompt 场景描述逐字一致。
+
+### 5. 天宫API照片URL被截断
+**现象：** Python打印URL时末尾 `.jpg` 被省略号截断，导致 wget 下载0字节文件。
+**原因：** Python print 默认截断长字符串或脚本中拼接URL时遗漏完整后缀。
+**解决：** 确保完整打印URL（不截断），下载前验证URL以 `.jpg` 或 `.png` 结尾。
+
+### 6. 多进程残留
+**现象：** 调试时反复启动脚本，产生多个并行运行的 Python 进程，浪费 API 额度。
+**解决：** run.py 启动时检查文件锁 `/tmp/billiards_video.lock`，若已存在则拒绝启动。执行完毕后自动释放锁。
+
+### 7. 测试API连通性不应新建任务
+**现象：** 为验证API正常，创建了5秒测试视频任务，浪费约2.5元。
+**解决：** 验证API连通性时，应查询已有任务状态（如 `GET /tasks/{已有task_id}`），而非创建新任务。
+
+## 视频分享
+
+生成完成后，自动将视频复制到 `/var/www/video/` 目录，生成分享链接：
+```
+https://tg.tiangong.club/share/{filename}
+```
+
+run.py 在整条流水线完成后会自动执行 `cp` 到分享目录。
 
 ## 成本参考
 

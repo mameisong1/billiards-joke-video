@@ -21,9 +21,11 @@
 """
 
 import argparse
+import fcntl
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -42,6 +44,8 @@ SEGMENT_DURATION = 10  # 秒
 RESOLUTION = "480p"
 RATIO = "9:16"
 VIDEO_DIR = Path("/root/video")
+SHARE_DIR = Path("/var/www/video")
+LOCK_FILE = "/tmp/billiards_video.lock"
 SEEDANCE_PY = os.path.expanduser("~/.openclaw/skills/seedance-video-generation/seedance.py")
 CONCAT_PY = os.path.expanduser("~/.openclaw/skills/video-concat/scripts/concat_video.py")
 DUB_PY = os.path.expanduser("~/.openclaw/skills/video-dubbing-v3/scripts/smart_dub.py")
@@ -461,27 +465,57 @@ def get_api_key():
 
 
 def api_call(method, url, data=None, api_key=None):
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    body = json.dumps(data).encode("utf-8") if data else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    """
+    用curl发HTTP请求，避免Python urllib在exec子进程中挂起。
+    
+    踩坑记录：
+    - Python urllib.request.urlopen() 在OpenClaw exec子进程中经常挂起无输出
+    - 含中文的body会触发 UnicodeEncodeError: 'latin-1' codec can't encode character
+    - 改用subprocess.run(["curl", ...]) 彻底解决这两个问题
+    """
+    cmd = ["curl", "-s", "-X", method, url,
+           "-H", f"Authorization: Bearer {api_key}",
+           "-H", "Content-Type: application/json"]
+    if data is not None:
+        cmd.extend(["-d", json.dumps(data, ensure_ascii=False)])
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-        try:
-            return json.loads(error_body)
-        except json.JSONDecodeError:
-            return {"error": {"message": error_body, "code": str(e.code)}}
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.stdout.strip():
+            return json.loads(result.stdout)
+        return {}
+    except subprocess.TimeoutExpired:
+        print(f"  ❌ API请求超时: {method} {url}", file=sys.stderr)
+        return {"error": {"message": "Request timeout", "code": "TIMEOUT"}}
+    except json.JSONDecodeError as e:
+        print(f"  ❌ API响应解析失败: {e}", file=sys.stderr)
+        return {"error": {"message": str(e), "code": "PARSE_ERROR"}}
 
 
 def create_task(api_key, prompt, first_frame_url=None, ref_image_urls=None):
+    """
+    创建Seedance视频生成任务。
+    
+    ⚠️ 重要限制：first_frame 与 reference_image 互斥！
+    API不允许同一请求中同时传入 first_frame 和 reference_image。
+    返回错误：InvalidParameter: first/last frame content cannot be mixed with reference media content
+    
+    因此：
+    - 段1：有 ref_image_urls 时传入，不传 first_frame
+    - 段2/段3：有 first_frame_url 时传入，不传 ref_image_urls（即使有也忽略并警告）
+    """
     content = [{"type": "text", "text": prompt}]
-    if ref_image_urls:
+    
+    # 互斥逻辑：first_frame 和 reference_image 不能共存
+    if first_frame_url:
+        # 续拍模式：只用 first_frame，忽略 ref_image_urls
+        content.append({"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"})
+        if ref_image_urls:
+            print(f"  ⚠️ first_frame 模式下忽略 {len(ref_image_urls)} 张 reference_image（API互斥限制）")
+    elif ref_image_urls:
+        # 参考图模式：只用 reference_image
         for url in ref_image_urls:
             content.append({"type": "image_url", "image_url": {"url": url}, "role": "reference_image"})
-    if first_frame_url:
-        content.append({"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"})
+    
     body = {
         "model": MODEL_ID, "content": content,
         "resolution": RESOLUTION, "duration": SEGMENT_DURATION, "ratio": RATIO,
@@ -490,10 +524,11 @@ def create_task(api_key, prompt, first_frame_url=None, ref_image_urls=None):
     result = api_call("POST", BASE_URL, body, api_key)
     if "error" in result:
         print(f"❌ 创建任务失败: {result['error']}")
-        # 检查是否是隐私过滤器
         err_msg = json.dumps(result['error'], ensure_ascii=False)
         if "PrivacyInformation" in err_msg or "隐私" in err_msg:
             print("  💡 提示：助教真人照片被隐私过滤器拦截，请改用文字描述")
+        if "first/last frame" in err_msg or "reference media" in err_msg:
+            print("  💡 提示：first_frame 和 reference_image 不可同时传入，请检查create_task逻辑")
         return None
     return result.get("id")
 
@@ -657,16 +692,23 @@ def main():
 
     # ============================================================
     # Step 3: 生成3段视频（串行链式续拍）
+    # 
+    # ⚠️ first_frame 与 reference_image 互斥：
+    # - 段1：传 reference_image（6张包房图），不传 first_frame
+    # - 段2/3：传 first_frame（上一段尾帧），不传 reference_image
+    # - 场景一致性保障：3段prompt场景描述逐字一致
     # ============================================================
     seg_paths = []
     last_frame_url = None
 
     for i in range(3):
         seg_num = i + 1
+        # 段1传参考图，段2/3只传first_frame（create_task内部处理互斥）
+        refs = scene_urls if (seg_num == 1 and scene_urls) else None
         video_path, last_frame_url = generate_segment(
             api_key, seg_num, prompts[i],
             first_frame_url=last_frame_url,
-            ref_image_urls=scene_urls if scene_urls else None,
+            ref_image_urls=refs,
         )
         if not video_path:
             print(f"❌ 第{seg_num}段生成失败，流程中止")
@@ -710,9 +752,48 @@ def main():
                 print(f"\n🎉 配音成品（旁白+BGM，无环境音）: {dubbed_path}")
         else:
             print(f"\n🎉 配音成品（旁白+BGM）: {dubbed_path}")
-    else:
-        print(f"\n🎉 视频成品: {final_path}")
+    # ============================================================
+    # Step 7: 自动生成分享链接
+    # ============================================================
+    # 确定最终输出的文件
+    final_output = final_path
+    if not args.no_dubbing and args.narration:
+        if env_audio_path and os.path.exists(env_audio_path) and not args.no_env_audio:
+            hybrid_path = str(output_dir / f"billiards_final_{timestamp}.mp4")
+            if os.path.exists(hybrid_path):
+                final_output = hybrid_path
+        dubbed_path_check = str(output_dir / f"billiards_dubbed_{timestamp}.mp4")
+        if os.path.exists(dubbed_path_check) and not os.path.exists(hybrid_path if 'hybrid_path' in dir() else ''):
+            final_output = dubbed_path_check
+    
+    # 复制到分享目录
+    SHARE_DIR.mkdir(parents=True, exist_ok=True)
+    share_filename = Path(final_output).name
+    share_path = SHARE_DIR / share_filename
+    shutil.copy2(final_output, str(share_path))
+    share_url = f"https://tg.tiangong.club/share/{share_filename}"
+    print(f"\n📺 分享链接: {share_url}")
 
 
 if __name__ == "__main__":
-    main()
+    # ============================================================
+    # 文件锁防重入
+    # ============================================================
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        print("❌ 另一个视频生成任务正在运行，请等待完成后再试")
+        print(f"   锁文件: {LOCK_FILE}")
+        sys.exit(1)
+    # 锁在进程退出时自动释放
+    
+    try:
+        main()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        try:
+            os.unlink(LOCK_FILE)
+        except OSError:
+            pass
